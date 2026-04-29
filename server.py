@@ -8,26 +8,37 @@ import json
 import logging
 import os
 import sqlite3
-import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import aiofiles
-import google.generativeai as genai
 import trafilatura
 import yt_dlp
 from dotenv import load_dotenv
-from youtube_transcript_api import YouTubeTranscriptApi
 from fastapi import FastAPI, HTTPException
+from google import genai
+from google.genai import types
 from pydantic import BaseModel, Field
+from youtube_transcript_api import YouTubeTranscriptApi
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Configure Gemini API
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+# ──────────────────────────────────────────────
+# Gemini Client (google-genai SDK)
+# ──────────────────────────────────────────────
+# Uses GEMINI_API_KEY from env automatically. The new SDK is client-based,
+# not module-level — one client instance is shared across all calls.
+gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+# Model selection by content type:
+# - 2.5-flash for text (tweets, articles): fast, cheap, plenty for tag+summary extraction
+# - 2.5-pro for video: the reasoning headroom is worth the cost when analyzing 10+ min of footage
+TEXT_MODEL = "gemini-2.5-flash"
+VIDEO_MODEL = "gemini-2.5-pro"
 
 # ──────────────────────────────────────────────
 # Configuration
@@ -37,8 +48,7 @@ VAULT_DIR = Path(__file__).parent / "vault"
 BOOKMARKS_FILE = VAULT_DIR / "bookmarks.md"
 TRANSCRIPTS_FILE = VAULT_DIR / "transcripts.md"
 INGEST_LOG_DB = VAULT_DIR / "ingest.log"
-TRANSCRIPTS_FILE = VAULT_DIR / "transcripts.md"
-transcript_lock = asyncio.Lock()  
+
 MAX_WORKER_CONCURRENCY = 3
 RETRY_DELAY_SECONDS = 5
 
@@ -68,22 +78,29 @@ class IngestPayload(BaseModel):
     selection: Optional[str] = Field(default=None, description="User-selected text if any")
 
 
-# ──────────────────────────────────────────────
-# FastAPI App
-# ──────────────────────────────────────────────
+class EnrichmentResult(BaseModel):
+    """
+    Schema enforced on Gemini's response. Using response_schema with this Pydantic
+    model means Gemini returns guaranteed-valid JSON matching this shape — no more
+    regex-fishing for {...} in the response text.
+    """
+    tags: list[str] = Field(default_factory=list, description="3-7 lowercase topical tags")
+    summary: str = Field(default="", description="One-sentence summary of the core idea")
+    key_insights: list[str] = Field(default_factory=list, description="2-5 standalone insights")
 
-app = FastAPI(title="Orbit Ingestion Server", version="2.0.0")
+
+# ──────────────────────────────────────────────
+# Async resources (created during lifespan startup)
+# ──────────────────────────────────────────────
 
 # Async queue for non-blocking ingestion
 ingest_queue: asyncio.Queue = asyncio.Queue()
 
-# File lock for safe concurrent appends to bookmarks.md
+# File locks for safe concurrent appends
 file_lock = asyncio.Lock()
-
-# File lock for safe concurrent appends to transcripts.md
 transcript_lock = asyncio.Lock()
 
-# LLM concurrency semaphore
+# LLM concurrency semaphore — caps simultaneous Gemini calls
 llm_semaphore = asyncio.Semaphore(MAX_WORKER_CONCURRENCY)
 
 # ──────────────────────────────────────────────
@@ -137,7 +154,15 @@ def log_ingest_entry(entry_id: str, source_url: str, entry_type: str, status: st
 # ──────────────────────────────────────────────
 
 
-def format_bookmark_entry(payload: IngestPayload, entry_id: str, tags: list = None, summary: str = None, key_insights: list = None, status: str = "ingested", content_header: str = "Content") -> str:
+def format_bookmark_entry(
+    payload: IngestPayload,
+    entry_id: str,
+    tags: list = None,
+    summary: str = None,
+    key_insights: list = None,
+    status: str = "ingested",
+    content_header: str = "Content",
+) -> str:
     """Render a bookmark entry with YAML frontmatter and Markdown body."""
     tags_json = json.dumps(tags or [])
     insights_json = "\n".join(f"  - {insight}" for insight in (key_insights or []))
@@ -200,14 +225,9 @@ async def extract_article_content(url: str) -> Optional[str]:
 
     Runs in a thread pool to avoid blocking the async event loop,
     since trafilatura is a synchronous library.
-
-    Returns the cleaned text, or None if extraction fails.
     """
     loop = asyncio.get_event_loop()
-    content = await loop.run_in_executor(
-        None, _trafilatura_extract, url
-    )
-    return content
+    return await loop.run_in_executor(None, _trafilatura_extract, url)
 
 
 def _trafilatura_extract(url: str) -> Optional[str]:
@@ -245,15 +265,7 @@ VIDEOS_DIR.mkdir(exist_ok=True)
 
 
 def extract_video_id(url: str) -> Optional[str]:
-    """
-    Extract the YouTube video ID from various URL formats.
-
-    Handles:
-    - https://www.youtube.com/watch?v=VIDEO_ID
-    - https://youtu.be/VIDEO_ID
-    - https://www.youtube.com/embed/VIDEO_ID
-    - https://www.youtube.com/shorts/VIDEO_ID
-    """
+    """Extract the YouTube video ID from various URL formats."""
     import re
 
     patterns = [
@@ -267,17 +279,9 @@ def extract_video_id(url: str) -> Optional[str]:
 
 
 async def extract_youtube_metadata(url: str) -> dict:
-    """
-    Use yt-dlp to extract real metadata from a YouTube video:
-    title, channel name, upload date, duration, description.
-
-    Runs in a thread pool since yt-dlp is synchronous.
-    """
+    """Use yt-dlp to extract real metadata from a YouTube video."""
     loop = asyncio.get_event_loop()
-    metadata = await loop.run_in_executor(
-        None, _yt_dlp_metadata, url
-    )
-    return metadata
+    return await loop.run_in_executor(None, _yt_dlp_metadata, url)
 
 
 def _yt_dlp_metadata(url: str) -> dict:
@@ -306,17 +310,9 @@ def _yt_dlp_metadata(url: str) -> dict:
 
 
 async def get_youtube_transcript(video_id: str) -> Optional[str]:
-    """
-    Fetch the full transcript for a YouTube video using youtube-transcript-api.
-
-    Runs in a thread pool since the library is synchronous.
-    Returns the transcript as a single text block, or None if unavailable.
-    """
+    """Fetch the full transcript for a YouTube video."""
     loop = asyncio.get_event_loop()
-    transcript = await loop.run_in_executor(
-        None, _fetch_transcript, video_id
-    )
-    return transcript
+    return await loop.run_in_executor(None, _fetch_transcript, video_id)
 
 
 def _fetch_transcript(video_id: str) -> Optional[str]:
@@ -327,14 +323,15 @@ def _fetch_transcript(video_id: str) -> Optional[str]:
         # Prefer manually created transcripts, fall back to auto-generated
         try:
             transcript = transcript_list.find_manually_created_transcript()
-        except:
+        except Exception:
             try:
                 transcript = transcript_list.find_generated_transcript()
-            except:
+            except Exception:
                 # Last resort: fetch the first available transcript in any language
-                transcript = transcript_list.find_transcript(transcript_list._transcripts[0][0])
+                transcript = transcript_list.find_transcript(
+                    transcript_list._transcripts[0][0]
+                )
 
-        # Fetch and join all segments
         segments = transcript.fetch()
         full_text = "\n".join(entry["text"] for entry in segments)
 
@@ -348,26 +345,14 @@ def _fetch_transcript(video_id: str) -> Optional[str]:
 
 
 async def download_video_locally(url: str, video_id: str) -> Optional[str]:
-    """
-    Download the best quality MP4 of a YouTube video to vault/videos/.
-
-    Runs in a thread pool since yt-dlp is synchronous.
-    Returns the path to the downloaded file, or None on failure.
-
-    This is a fire-and-forget background task — it does not block
-    the ingest pipeline. The bookmark is saved to the vault regardless
-    of whether the video download succeeds.
-    """
+    """Download the best quality MP4 of a YouTube video to vault/videos/."""
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None, _yt_dlp_download, url, video_id
-    )
-    return result
+    return await loop.run_in_executor(None, _yt_dlp_download, url, video_id)
 
 
 def _yt_dlp_download(url: str, video_id: str) -> Optional[str]:
     """Synchronous wrapper for yt-dlp video download."""
-    output_template = str(VIDEOS_DIR / f"%(id)s_%(title).100s.%(ext)s")
+    output_template = str(VIDEOS_DIR / "%(id)s_%(title).100s.%(ext)s")
 
     ydl_opts = {
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
@@ -382,7 +367,6 @@ def _yt_dlp_download(url: str, video_id: str) -> Optional[str]:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
-            # yt-dlp may produce .mkv if merge fails, handle gracefully
             if filepath:
                 logger.info(f"[YouTube] Video saved to {filepath}")
                 return filepath
@@ -393,132 +377,137 @@ def _yt_dlp_download(url: str, video_id: str) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────
-# LLM Enrichment (Stub — plug in your provider)
+# LLM Enrichment (google-genai SDK)
 # ──────────────────────────────────────────────
+
+ENRICHMENT_PROMPT = """You are a research librarian organizing someone's personal knowledge graph. Analyze this content and extract:
+
+- 3-7 lowercase topical tags (single words or hyphenated phrases, no spaces)
+- A one-sentence summary capturing the core idea in the author's voice
+- 2-5 standalone insights — each should be readable on its own, without needing the original
+
+Be concrete. Avoid filler like "discusses" or "talks about". If the content is thin, return fewer tags and insights rather than padding."""
 
 
 async def enrich_with_llm(payload: IngestPayload) -> dict:
     """
-    Use Google Gemini to analyze content and extract structured insights.
-    
-    For YouTube videos: Upload local MP4 file and analyze with Gemini vision
-    For text content (tweets/articles): Send content as text prompt
-    
-    Returns dict with tags, summary, key_insights, and optionally transcript for videos.
+    Enrich content with Gemini, returning structured tags/summary/insights.
+
+    For YouTube videos with a local MP4 available, uploads the file and uses
+    the multimodal pro model. For everything else, uses text-only flash.
+
+    Uses response_schema to guarantee valid JSON output — no regex parsing,
+    no markdown-fenced JSON to strip, no fallback-on-malformed-output paths.
     """
     async with llm_semaphore:
         try:
-            # Determine if this is YouTube content
             is_youtube = (
                 payload.source_platform == "youtube"
                 or "youtube.com" in payload.source_url
                 or "youtu.be" in payload.source_url
             )
-            
-            # Prepare the prompt for Gemini
-            prompt = """You are a Research Librarian. Analyze this content and return a JSON object with: 
-            {tags: [], summary: '', key_insights: []}. 
-            If this is a video, also include a full 'transcript' string in the JSON."""
-            
+
+            generation_config = types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=EnrichmentResult,
+                system_instruction=ENRICHMENT_PROMPT,
+            )
+
+            # ── Video path: upload MP4, wait for processing, then analyze ──
             if is_youtube:
-                # For YouTube: Try to find and upload local video file
                 video_id = extract_video_id(payload.source_url)
                 if video_id:
-                    # Look for existing video file in vault/videos/
                     video_files = list(VIDEOS_DIR.glob(f"{video_id}_*.mp4"))
                     if video_files:
-                        video_path = video_files[0]  # Take the first match
-                        logger.info(f"[Gemini] Found local video: {video_path.name}")
-                        
-                        # Upload the video file to Gemini
-                        video_file = genai.upload_file(path=str(video_path))
-                        logger.info(f"[Gemini] Uploaded video file: {video_file.uri}")
-                        
-                        # Wait for the video to be processed
-                        while video_file.state.name == "PROCESSING":
-                            logger.info("[Gemini] Waiting for video to be processed...")
+                        video_path = video_files[0]
+                        logger.info(f"[Gemini] Uploading local video: {video_path.name}")
+
+                        # Upload via async client. The new SDK uses client.aio.files.upload
+                        uploaded = await gemini_client.aio.files.upload(
+                            file=str(video_path)
+                        )
+                        logger.info(f"[Gemini] Uploaded: {uploaded.name}")
+
+                        # Poll until ACTIVE — Gemini processes video before it can be referenced
+                        while uploaded.state.name == "PROCESSING":
+                            logger.info("[Gemini] Waiting for video processing…")
                             await asyncio.sleep(2)
-                            video_file = genai.get_file(video_file.name)
-                        
-                        if video_file.state.name == "ACTIVE":
-                            # Analyze the video with Gemini
-                            model = genai.GenerativeModel('gemini-1.5-pro-latest')
-                            response = await model.generate_content_async([prompt, video_file])
-                            
-                            # Clean up: delete the uploaded file
-                            genai.delete_file(video_file.name)
-                            logger.info(f"[Gemini] Deleted uploaded file: {video_file.name}")
-                            
-                            # Parse and return the response
-                            return _parse_gemini_response(response.text)
+                            uploaded = await gemini_client.aio.files.get(name=uploaded.name)
+
+                        if uploaded.state.name == "ACTIVE":
+                            response = await gemini_client.aio.models.generate_content(
+                                model=VIDEO_MODEL,
+                                contents=[
+                                    "Analyze this video for my knowledge graph.",
+                                    uploaded,
+                                ],
+                                config=generation_config,
+                            )
+
+                            # Cleanup: delete uploaded file from Gemini's temp storage
+                            try:
+                                await gemini_client.aio.files.delete(name=uploaded.name)
+                            except Exception as cleanup_err:
+                                logger.warning(f"[Gemini] File cleanup failed: {cleanup_err}")
+
+                            return _parse_structured_response(response)
                         else:
-                            logger.error(f"[Gemini] Video processing failed: {video_file.state.name}")
+                            logger.error(f"[Gemini] Video processing failed: {uploaded.state.name}")
                     else:
-                        logger.warning(f"[Gemini] No local video found for {video_id}")
+                        logger.warning(f"[Gemini] No local video found for {video_id}, falling back to text")
                 else:
                     logger.warning(f"[Gemini] Could not extract video ID from {payload.source_url}")
-            
-            # For text content (or if YouTube video processing failed): Use text prompt
-            logger.info("[Gemini] Using text-only analysis")
-            model = genai.GenerativeModel('gemini-1.5-pro-latest')
-            response = await model.generate_content_async([prompt, payload.content])
-            return _parse_gemini_response(response.text)
-            
+
+            # ── Text path: tweet, article, or YouTube fallback to transcript text ──
+            content_for_analysis = payload.content or payload.title or payload.source_url
+            if not content_for_analysis.strip():
+                logger.warning("[Gemini] No content to analyze, returning empty enrichment")
+                return _empty_enrichment()
+
+            response = await gemini_client.aio.models.generate_content(
+                model=TEXT_MODEL,
+                contents=content_for_analysis,
+                config=generation_config,
+            )
+            return _parse_structured_response(response)
+
         except Exception as e:
-            logger.error(f"[Gemini] Error during analysis: {e}")
-            # Fallback to stub response on error
-            return {
-                "tags": [],
-                "summary": None,
-                "key_insights": [],
-            }
+            logger.error(f"[Gemini] Enrichment failed: {e}")
+            return _empty_enrichment()
 
 
-def _parse_gemini_response(response_text: str) -> dict:
-    """Parse Gemini's JSON response into a dict."""
-    import re
-    
+def _parse_structured_response(response) -> dict:
+    """
+    Parse a Gemini response that was constrained by response_schema.
+
+    With response_schema set, response.parsed is the typed Pydantic instance.
+    response.text is the raw JSON. We try parsed first, fall back to text.
+    """
     try:
-        # Try to extract JSON from the response
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(0)
-            result = json.loads(json_str)
-            
-            # Ensure required fields exist
-            result.setdefault("tags", [])
-            result.setdefault("summary", None)
-            result.setdefault("key_insights", [])
-            
-            logger.info(f"[Gemini] Successfully parsed response: {result}")
-            return result
-        else:
-            logger.warning("[Gemini] No JSON found in response")
+        # The SDK populates .parsed when response_schema is set
+        if hasattr(response, "parsed") and response.parsed is not None:
+            result: EnrichmentResult = response.parsed
+            logger.info(f"[Gemini] Enriched: {len(result.tags)} tags, {len(result.key_insights)} insights")
             return {
-                "tags": [],
-                "summary": None,
-                "key_insights": [],
+                "tags": result.tags,
+                "summary": result.summary or None,
+                "key_insights": result.key_insights,
             }
-    except json.JSONDecodeError as e:
-        logger.error(f"[Gemini] Failed to parse JSON: {e}")
+
+        # Fallback: parse the text directly
+        data = json.loads(response.text)
         return {
-            "tags": [],
-            "summary": None,
-            "key_insights": [],
+            "tags": data.get("tags", []),
+            "summary": data.get("summary") or None,
+            "key_insights": data.get("key_insights", []),
         }
+    except (json.JSONDecodeError, AttributeError) as e:
+        logger.error(f"[Gemini] Failed to parse structured response: {e}")
+        return _empty_enrichment()
 
 
-# ──────────────────────────────────────────────
-# File Writer
-# ──────────────────────────────────────────────
-
-
-async def append_to_vault(entry: str):
-    """Append a formatted bookmark entry to vault/bookmarks.md with an async lock."""
-    async with file_lock:
-        async with aiofiles.open(str(BOOKMARKS_FILE), mode="a", encoding="utf-8") as f:
-            await f.write(entry)
-        logger.info(f"[Vault] Appended entry to {BOOKMARKS_FILE}")
+def _empty_enrichment() -> dict:
+    return {"tags": [], "summary": None, "key_insights": []}
 
 
 # ──────────────────────────────────────────────
@@ -532,11 +521,11 @@ async def background_worker():
 
     For each payload:
     1. Pop from queue
-    2. Generate UUID
-    3. Call LLM for enrichment
-    4. Format as Markdown with frontmatter
-    5. Append to vault/bookmarks.md (with file lock)
-    6. Log status to SQLite
+    2. Generate UUID and log as 'processing'
+    3. Type-specific extraction (YouTube transcript/metadata/video, article fetch)
+    4. Gemini enrichment
+    5. Append to vault file (bookmarks.md or transcripts.md) under file lock
+    6. Log final status to SQLite
     """
     logger.info("[Worker] Background worker started.")
 
@@ -545,34 +534,34 @@ async def background_worker():
             payload: IngestPayload = await ingest_queue.get()
             entry_id = str(uuid.uuid4())
 
-            logger.info(f"[Worker] Processing: {payload.source_url} (id={entry_id})")
+            # Compute once per iteration — used in extraction, enrichment, and routing
+            is_youtube = (
+                payload.source_platform == "youtube"
+                or "youtube.com" in payload.source_url
+                or "youtu.be" in payload.source_url
+            )
 
+            logger.info(f"[Worker] Processing: {payload.source_url} (id={entry_id})")
             log_ingest_entry(entry_id, payload.source_url, payload.type, "processing")
 
             try:
                 # ── YouTube: transcript, metadata, video download ──
-                is_youtube = (
-                    payload.source_platform == "youtube"
-                    or "youtube.com" in payload.source_url
-                    or "youtu.be" in payload.source_url
-                )
-
                 if is_youtube:
                     video_id = extract_video_id(payload.source_url)
                     if video_id:
                         logger.info(f"[Worker] YouTube video detected: {video_id}")
 
-                        # Fetch transcript and use as content if payload is empty
                         if not payload.content.strip():
                             transcript = await get_youtube_transcript(video_id)
                             if transcript:
                                 payload.content = transcript
                                 logger.info(f"[Worker] Transcript fetched: {len(transcript)} chars")
                             else:
-                                payload.content = f"[No transcript available for this video]\n\nURL: {payload.source_url}"
+                                payload.content = (
+                                    f"[No transcript available for this video]\n\nURL: {payload.source_url}"
+                                )
                                 logger.warning(f"[Worker] No transcript for {video_id}")
 
-                        # Enrich metadata with real YouTube data
                         metadata = await extract_youtube_metadata(payload.source_url)
                         if metadata:
                             if metadata.get("title") and not payload.title:
@@ -584,7 +573,8 @@ async def background_worker():
                                 payload.published_at = metadata["upload_date"]
                             logger.info(f"[Worker] YouTube metadata enriched: {payload.title} by {payload.author}")
 
-                        # Trigger video download as a fire-and-forget background task
+                        # Fire-and-forget: video download runs in parallel with enrichment.
+                        # The bookmark gets saved either way.
                         asyncio.create_task(download_video_locally(payload.source_url, video_id))
 
                 # ── Article: full-text extraction via trafilatura ──
@@ -599,20 +589,22 @@ async def background_worker():
                         payload.content = f"[User selection]\n\n{payload.selection}"
                         logger.info(f"[Worker] Falling back to user selection: {len(payload.selection)} chars")
                     else:
-                        payload.content = f"[Failed to extract content from {payload.source_url}]\n\nThe page could not be parsed. The URL has been saved for reference."
-                        logger.warning(f"[Worker] Article extraction failed and no selection available: {payload.source_url}")
+                        payload.content = (
+                            f"[Failed to extract content from {payload.source_url}]\n\n"
+                            "The page could not be parsed. The URL has been saved for reference."
+                        )
+                        logger.warning(f"[Worker] Article extraction failed: {payload.source_url}")
 
+                # ── Enrichment ──
                 enrichment = await enrich_with_llm(payload)
 
-                # Route: YouTube → transcripts.md, everything else → bookmarks.md
-                is_youtube = (
-                    payload.source_platform == "youtube"
-                    or "youtube.com" in payload.source_url
-                    or "youtu.be" in payload.source_url
-                )
-
+                # ── Route to correct vault file ──
                 if is_youtube:
-                    content_header = "Transcript" if payload.content and "[No transcript" not in payload.content else "Content"
+                    content_header = (
+                        "Transcript"
+                        if payload.content and "[No transcript" not in payload.content
+                        else "Content"
+                    )
                     entry = format_bookmark_entry(
                         payload=payload,
                         entry_id=entry_id,
@@ -645,16 +637,11 @@ async def background_worker():
             except Exception as e:
                 logger.error(f"[Worker] Processing failed for {payload.source_url}: {e}")
 
+                # On failure, still save a stub entry so the URL isn't lost
                 entry = format_bookmark_entry(
                     payload=payload,
                     entry_id=entry_id,
                     status="failed",
-                )
-
-                is_youtube = (
-                    payload.source_platform == "youtube"
-                    or "youtube.com" in payload.source_url
-                    or "youtu.be" in payload.source_url
                 )
 
                 if is_youtube:
@@ -672,8 +659,38 @@ async def background_worker():
                 ingest_queue.task_done()
 
         except Exception as e:
-            logger.error(f"[Worker] Unexpected error: {e}")
+            logger.error(f"[Worker] Unexpected error in worker loop: {e}")
             await asyncio.sleep(1)
+
+
+# ──────────────────────────────────────────────
+# FastAPI App + Lifespan
+# ──────────────────────────────────────────────
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Replaces the deprecated @app.on_event("startup") pattern.
+    Initializes SQLite log and spawns the background worker on startup.
+    The worker task runs until shutdown, when it's cancelled cleanly.
+    """
+    init_ingest_log()
+    worker_task = asyncio.create_task(background_worker())
+    logger.info("[Server] Orbit V2 ingestion server started.")
+
+    yield
+
+    # Shutdown: cancel the worker, wait for in-flight items
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
+    logger.info("[Server] Orbit V2 ingestion server stopped.")
+
+
+app = FastAPI(title="Orbit Ingestion Server", version="2.0.0", lifespan=lifespan)
 
 
 # ──────────────────────────────────────────────
@@ -681,20 +698,13 @@ async def background_worker():
 # ──────────────────────────────────────────────
 
 
-@app.on_event("startup")
-async def startup():
-    """Initialize the ingest log and start the background worker."""
-    init_ingest_log()
-    asyncio.create_task(background_worker())
-    logger.info("[Server] Orbit V2 ingestion server started.")
-
-
 @app.post("/ingest", status_code=202)
 async def ingest(payload: IngestPayload):
     """
     Accept a normalized bookmark payload and queue it for async processing.
 
-    Returns 202 Accepted immediately — processing happens in the background.
+    Returns 202 Accepted immediately — the user never waits for LLM enrichment
+    or video download. Processing happens in the background worker.
     """
     await ingest_queue.put(payload)
     logger.info(f"[API] Queued: {payload.source_url} (queue size: {ingest_queue.qsize()})")
